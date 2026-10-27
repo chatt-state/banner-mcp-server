@@ -1,66 +1,57 @@
 #!/usr/bin/env node
 
 /**
- * Banner MCP Server
+ * Banner MCP Server entry point.
  *
- * Entry point for the MCP server that provides access to
- * Ellucian Banner via the Ethos Integration and native REST APIs.
- * Loads configuration, registers tools, pre-loads configured domains,
- * and starts the selected transport (stdio or HTTP).
+ * Loads and validates configuration, then starts the selected transport
+ * (stdio or HTTP). Exits non-zero with a one-line message on bad config.
  */
 
-import { getConfig } from './config.js';
-import { mcpServer } from './server.js';
-import { domainRegistry, type DomainName, DOMAIN_NAMES } from './domains/registry.js';
+import { ConfigError, getConfig } from './config.js';
+import { setAuditEnabled } from './audit.js';
+import { log, setLogLevel } from './log.js';
 import { startStdioTransport } from './transport/stdio.js';
 import { startHttpTransport } from './transport/http.js';
 
-/**
- * Checks whether a string is a valid DomainName.
- */
-function isValidDomain(value: string): value is DomainName {
-  return (DOMAIN_NAMES as readonly string[]).includes(value);
-}
-
 async function main() {
-  const config = getConfig();
-
-  // Wire up the domain registry with the server reference
-  domainRegistry.setServer(mcpServer);
-
-  // Pre-load configured domains
-  for (const domain of config.preloadDomains) {
-    if (isValidDomain(domain)) {
-      try {
-        await domainRegistry.loadDomain(domain);
-        console.error(`Pre-loaded domain: ${domain}`);
-      } catch (err) {
-        console.error(`Failed to pre-load domain "${domain}":`, err);
-      }
-    } else {
-      console.error(`Skipping unknown domain in preloadDomains: "${domain}"`);
+  let config;
+  try {
+    config = getConfig();
+  } catch (err) {
+    if (err instanceof ConfigError) {
+      process.stderr.write(`Configuration error: ${err.message}\n`);
+      process.exit(2);
     }
+    throw err;
   }
+  setAuditEnabled(config.auditLog);
+  setLogLevel(config.logLevel);
 
-  // Start the selected transport
+  let shutdown: () => Promise<void>;
   if (config.transport === 'stdio') {
-    await startStdioTransport();
+    const mcp = await startStdioTransport(config);
+    shutdown = () => mcp.server.close();
   } else {
-    await startHttpTransport();
+    const app = await startHttpTransport(config);
+    shutdown = () => app.close();
   }
 
-  // Graceful shutdown
-  const shutdown = async () => {
-    console.error('Shutting down Banner MCP Server...');
-    await mcpServer.close();
-    process.exit(0);
+  let stopping = false;
+  const stop = () => {
+    if (stopping) return;
+    stopping = true;
+    log('info', 'Shutting down Banner MCP Server...');
+    shutdown()
+      .catch(() => undefined)
+      .finally(() => process.exit(0));
   };
-
-  process.on('SIGTERM', () => void shutdown());
-  process.on('SIGINT', () => void shutdown());
+  process.on('SIGTERM', stop);
+  process.on('SIGINT', stop);
 }
 
 main().catch((err: unknown) => {
-  console.error('Failed to start Banner MCP Server:', err);
+  process.stderr.write(
+    `Failed to start Banner MCP Server: ${err instanceof Error ? err.message : String(err)}\n`,
+  );
   process.exit(1);
 });

@@ -1,160 +1,95 @@
 /**
  * Domain registry for MCP tool registration.
  *
- * Manages the registration and discovery of domain-specific
- * tool handlers (student, financial aid, finance, HR, ethos).
+ * Each McpServer (one per stdio process, one per HTTP session) owns its own
+ * DomainRegistry. Domains are registered on demand; the tool names reported
+ * for a domain are the names it actually registered (captured by the
+ * ToolRegistrar), so they cannot drift from the code.
  */
 
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { ToolRegistrar } from '../tools/define.js';
+import { DOMAIN_NAMES, type DomainName } from './names.js';
+import { register as registerStudent } from './student/index.js';
+import { register as registerFinancialAid } from './financial-aid/index.js';
+import { register as registerFinance } from './finance/index.js';
+import { register as registerHr } from './hr/index.js';
+import { register as registerEthos } from './ethos/index.js';
 
-/** All supported domain names. */
-export const DOMAIN_NAMES = [
-  'student',
-  'financial_aid',
-  'finance',
-  'hr',
-  'ethos',
-] as const;
+export { DOMAIN_NAMES, type DomainName } from './names.js';
 
-export type DomainName = (typeof DOMAIN_NAMES)[number];
+/** Interface that each domain module implements. */
+export type DomainRegisterFn = (reg: ToolRegistrar) => void;
 
-/** Interface that each domain module must implement. */
-export interface DomainModule {
-  register(server: McpServer): void;
-}
-
-/** Maps domain names to their module import paths. */
-const MODULE_MAP: Record<DomainName, string> = {
-  student: './student/index.js',
-  financial_aid: './financial-aid/index.js',
-  finance: './finance/index.js',
-  hr: './hr/index.js',
-  ethos: './ethos/index.js',
+/** Domain name to register function. */
+export const DOMAIN_MODULES: Record<DomainName, DomainRegisterFn> = {
+  student: registerStudent,
+  financial_aid: registerFinancialAid,
+  finance: registerFinance,
+  hr: registerHr,
+  ethos: registerEthos,
 };
 
-/** Known tool names per domain for reporting after load. */
-const DOMAIN_TOOLS: Record<DomainName, string[]> = {
-  student: [
-    'banner_persons_search',
-    'banner_persons_get',
-    'banner_students_search',
-    'banner_students_get',
-    'banner_courses_get',
-    'banner_sections_search',
-    'banner_academic_periods_get',
-  ],
-  financial_aid: [
-    'banner_financial_aid_applications_search',
-    'banner_financial_aid_applications_get',
-    'banner_financial_aid_awards_search',
-    'banner_financial_aid_awards_get',
-  ],
-  finance: [
-    'banner_accounting_strings_search',
-    'banner_accounting_strings_get',
-    'banner_ledger_activities_search',
-    'banner_ledger_activities_get',
-  ],
-  hr: [
-    'banner_employees_search',
-    'banner_employees_get',
-    'banner_positions_search',
-    'banner_positions_get',
-    'banner_jobs_search',
-    'banner_jobs_get',
-  ],
-  ethos: [
-    'banner_ethos_get',
-    'banner_ethos_get_all',
-    'banner_ethos_create',
-    'banner_ethos_update',
-    'banner_ethos_delete',
-    'banner_ethos_graphql',
-    'banner_ethos_qapi_search',
-    'banner_ethos_filter',
-    'banner_ethos_consume_notifications',
-  ],
+/** One-line description per domain, used by banner_navigate. */
+export const DOMAIN_DESCRIPTIONS: Record<DomainName, string> = {
+  student:
+    'person lookup by Banner ID/email/name, student context, persons, students, courses, sections, registrations, academic periods',
+  financial_aid: 'financial aid applications and student awards',
+  finance: 'accounting strings and ledger activities',
+  hr: 'employees, positions and jobs',
+  ethos: 'generic EEDM get/list/filter, QAPI search, GraphQL (writes only when enabled)',
 };
 
 /**
- * Registry that manages lazy-loading of domain tool sets.
- *
- * Domains are loaded on demand via `loadDomain()`. Once loaded,
- * their tools are registered with the MCP server and clients
- * are notified of the tool list change.
+ * Registry that manages lazy registration of domain tool sets on one server.
  */
-class DomainRegistry {
-  private loadedDomains = new Set<DomainName>();
-  private serverRef: McpServer | null = null;
+export class DomainRegistry {
+  private readonly loaded = new Map<DomainName, string[]>();
+
+  constructor(
+    private readonly registrar: ToolRegistrar,
+    private readonly modules: Record<DomainName, DomainRegisterFn> = DOMAIN_MODULES,
+  ) {}
 
   /**
-   * Sets the MCP server reference used when registering domain tools.
+   * Registers a domain's tools. Returns the tool names it registered, or an
+   * empty array if it was already loaded.
    */
-  setServer(server: McpServer): void {
-    this.serverRef = server;
+  loadDomain(domain: DomainName): string[] {
+    if (this.loaded.has(domain)) return [];
+    const register = this.modules[domain];
+    if (!register) throw new Error(`Unknown domain "${domain}"`);
+    const mark = this.registrar.registered.length;
+    register(this.registrar);
+    const names = this.registrar.namesSince(mark);
+    this.loaded.set(domain, names);
+    if (this.registrar.server.isConnected()) {
+      this.registrar.server.sendToolListChanged();
+    }
+    return names;
   }
 
-  /**
-   * Loads a domain module and registers its tools with the MCP server.
-   *
-   * If the domain is already loaded, returns an empty array immediately.
-   * Otherwise, dynamically imports the module, calls its `register()`
-   * function, and notifies connected clients of the tool list change.
-   *
-   * @returns The names of tools registered by the domain.
-   */
-  async loadDomain(domain: DomainName): Promise<string[]> {
-    if (this.loadedDomains.has(domain)) {
-      return [];
-    }
-
-    const server = this.serverRef;
-    if (server === null) {
-      throw new Error('DomainRegistry: server not set. Call setServer() first.');
-    }
-
-    const domainModule = await this.importDomain(domain);
-    domainModule.register(server);
-    this.loadedDomains.add(domain);
-
-    server.sendToolListChanged();
-
-    return this.getToolNamesForDomain(domain);
-  }
-
-  /**
-   * Returns the known tool names for a given domain.
-   */
+  /** Tool names registered by a loaded domain (empty if not loaded). */
   getToolNamesForDomain(domain: DomainName): string[] {
-    return DOMAIN_TOOLS[domain] ?? [];
+    return [...(this.loaded.get(domain) ?? [])];
+  }
+
+  /** Map of loaded domain to its tool names. */
+  getToolsByDomain(): Partial<Record<DomainName, string[]>> {
+    return Object.fromEntries([...this.loaded].map(([d, names]) => [d, [...names]]));
   }
 
   /** Returns all currently loaded domain names. */
   getLoadedDomains(): DomainName[] {
-    return [...this.loadedDomains];
+    return [...this.loaded.keys()];
+  }
+
+  /** Domains not yet loaded. */
+  getAvailableDomains(): DomainName[] {
+    return DOMAIN_NAMES.filter((d) => !this.loaded.has(d));
   }
 
   /** Checks whether a specific domain has been loaded. */
   isDomainLoaded(domain: DomainName): boolean {
-    return this.loadedDomains.has(domain);
-  }
-
-  /**
-   * Resets the registry state. Primarily useful for testing.
-   */
-  reset(): void {
-    this.loadedDomains.clear();
-    this.serverRef = null;
-  }
-
-  /**
-   * Dynamically imports a domain module by name.
-   */
-  private async importDomain(domain: DomainName): Promise<DomainModule> {
-    const modulePath = MODULE_MAP[domain];
-    return import(modulePath) as Promise<DomainModule>;
+    return this.loaded.has(domain);
   }
 }
-
-/** Singleton DomainRegistry instance. */
-export const domainRegistry = new DomainRegistry();

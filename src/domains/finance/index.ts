@@ -1,124 +1,45 @@
 /**
- * Finance domain module.
- *
- * Provides tools for searching and retrieving accounting strings
- * and ledger activities via the Ethos typed resource accessors.
+ * Finance domain module: accounting strings and ledger activities.
  */
 
-import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { wrapToolHandler } from '../../middleware/error-handler.js';
-import { getEthosClient } from '../../banner-client.js';
+import { defineGetTool, defineSearchTool } from '../../tools/resource.js';
+import type { ToolRegistrar } from '../../tools/define.js';
 
-/** Registers finance domain tools with the MCP server. */
-export function register(server: McpServer): void {
-  server.registerTool(
+/** Registers finance domain tools. */
+export function register(reg: ToolRegistrar): void {
+  const ethos = reg.deps.ethos;
+
+  defineSearchTool(
+    reg,
     'banner_accounting_strings_search',
-    {
-      title: 'Search Accounting Strings',
-      description:
-        'Search for accounting strings in Banner via Ethos. Returns paginated results.',
-      inputSchema: {
-        offset: z.number().int().min(0).optional().describe('Pagination offset (default: 0)'),
-        limit: z.number().int().min(1).max(500).optional().describe('Page size (default: 25)'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const page = await getEthosClient().accountingStrings.getPage(args.offset, args.limit);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  totalCount: page.totalCount,
-                  offset: page.offset,
-                  hasMore: page.hasMore,
-                  count: page.data.length,
-                  data: page.data,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      });
-    },
+    'Search Accounting Strings',
+    'List accounting strings (EEDM accounting-strings v7).',
+    {},
+    (a) => ethos().accountingStrings.getPage(a.offset, a.limit),
   );
-
-  server.registerTool(
+  defineGetTool(
+    reg,
     'banner_accounting_strings_get',
-    {
-      title: 'Get Accounting String',
-      description: 'Get a single accounting string by GUID from Banner via Ethos.',
-      inputSchema: {
-        id: z.string().describe('Accounting string GUID'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const data = await getEthosClient().accountingStrings.get(args.id);
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
-        };
-      });
-    },
+    'Get Accounting String',
+    'Get an accounting string by GUID.',
+    'Accounting string GUID',
+    (id) => ethos().accountingStrings.get(id),
   );
 
-  server.registerTool(
+  defineSearchTool(
+    reg,
     'banner_ledger_activities_search',
-    {
-      title: 'Search Ledger Activities',
-      description:
-        'Search for ledger activities in Banner via Ethos. Returns paginated results.',
-      inputSchema: {
-        offset: z.number().int().min(0).optional().describe('Pagination offset (default: 0)'),
-        limit: z.number().int().min(1).max(500).optional().describe('Page size (default: 25)'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const page = await getEthosClient().ledgerActivities.getPage(args.offset, args.limit);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  totalCount: page.totalCount,
-                  offset: page.offset,
-                  hasMore: page.hasMore,
-                  count: page.data.length,
-                  data: page.data,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      });
-    },
+    'Search Ledger Activities',
+    'List ledger activities (EEDM ledger-activities, latest version).',
+    {},
+    (a) => ethos().ledgerActivities.getPage(a.offset, a.limit),
   );
-
-  server.registerTool(
+  defineGetTool(
+    reg,
     'banner_ledger_activities_get',
-    {
-      title: 'Get Ledger Activity',
-      description: 'Get a single ledger activity by GUID from Banner via Ethos.',
-      inputSchema: {
-        id: z.string().describe('Ledger activity GUID'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const data = await getEthosClient().ledgerActivities.get(args.id);
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
-        };
-      });
-    },
+    'Get Ledger Activity',
+    'Get a ledger activity by GUID.',
+    'Ledger activity GUID',
+    (id) => ethos().ledgerActivities.get(id),
   );
 }

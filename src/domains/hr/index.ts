@@ -1,176 +1,75 @@
 /**
- * HR domain module.
- *
- * Provides tools for searching and retrieving employees, positions,
- * and jobs via the Ethos typed resource accessors.
+ * HR domain module: employees, institution positions and institution jobs.
  */
 
-import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { wrapToolHandler } from '../../middleware/error-handler.js';
-import { getEthosClient } from '../../banner-client.js';
+import { defineGetTool, defineSearchTool } from '../../tools/resource.js';
+import { guid, type ToolRegistrar } from '../../tools/define.js';
+import { personRefCriteria } from '../student/criteria.js';
 
-/** Registers HR domain tools with the MCP server. */
-export function register(server: McpServer): void {
-  server.registerTool(
+/** Registers HR domain tools. */
+export function register(reg: ToolRegistrar): void {
+  const ethos = reg.deps.ethos;
+
+  defineSearchTool(
+    reg,
     'banner_employees_search',
-    {
-      title: 'Search Employees',
-      description: 'Search for employees in Banner via Ethos. Returns paginated results.',
-      inputSchema: {
-        offset: z.number().int().min(0).optional().describe('Pagination offset (default: 0)'),
-        limit: z.number().int().min(1).max(500).optional().describe('Page size (default: 25)'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const page = await getEthosClient().employees.getPage(args.offset, args.limit);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  totalCount: page.totalCount,
-                  offset: page.offset,
-                  hasMore: page.hasMore,
-                  count: page.data.length,
-                  data: page.data,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      });
+    'Search Employees',
+    'List employee records (EEDM employees v12). Pass personId (person GUID, from ' +
+      'banner_person_lookup) to get the employee record for one person.',
+    { personId: guid('Person GUID').optional() },
+    (a) => {
+      const criteria = personRefCriteria(a.personId);
+      return criteria
+        ? ethos().employees.filter(criteria, a.offset, a.limit)
+        : ethos().employees.getPage(a.offset, a.limit);
     },
   );
-
-  server.registerTool(
+  defineGetTool(
+    reg,
     'banner_employees_get',
-    {
-      title: 'Get Employee',
-      description: 'Get a single employee by GUID from Banner via Ethos.',
-      inputSchema: {
-        id: z.string().describe('Employee GUID'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const data = await getEthosClient().employees.get(args.id);
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
-        };
-      });
-    },
+    'Get Employee',
+    'Get an employee record by GUID.',
+    'Employee GUID',
+    (id) => ethos().employees.get(id),
   );
 
-  server.registerTool(
+  defineSearchTool(
+    reg,
     'banner_positions_search',
-    {
-      title: 'Search Positions',
-      description: 'Search for positions in Banner via Ethos. Returns paginated results.',
-      inputSchema: {
-        offset: z.number().int().min(0).optional().describe('Pagination offset (default: 0)'),
-        limit: z.number().int().min(1).max(500).optional().describe('Page size (default: 25)'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const page = await getEthosClient().positions.getPage(args.offset, args.limit);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  totalCount: page.totalCount,
-                  offset: page.offset,
-                  hasMore: page.hasMore,
-                  count: page.data.length,
-                  data: page.data,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      });
-    },
+    'Search Positions',
+    'List institution positions (EEDM institution-positions v12).',
+    {},
+    (a) => ethos().positions.getPage(a.offset, a.limit),
   );
-
-  server.registerTool(
+  defineGetTool(
+    reg,
     'banner_positions_get',
-    {
-      title: 'Get Position',
-      description: 'Get a single position by GUID from Banner via Ethos.',
-      inputSchema: {
-        id: z.string().describe('Position GUID'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const data = await getEthosClient().positions.get(args.id);
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
-        };
-      });
-    },
+    'Get Position',
+    'Get an institution position by GUID.',
+    'Position GUID',
+    (id) => ethos().positions.get(id),
   );
 
-  server.registerTool(
+  defineSearchTool(
+    reg,
     'banner_jobs_search',
-    {
-      title: 'Search Jobs',
-      description: 'Search for jobs in Banner via Ethos. Returns paginated results.',
-      inputSchema: {
-        offset: z.number().int().min(0).optional().describe('Pagination offset (default: 0)'),
-        limit: z.number().int().min(1).max(500).optional().describe('Page size (default: 25)'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const page = await getEthosClient().jobs.getPage(args.offset, args.limit);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  totalCount: page.totalCount,
-                  offset: page.offset,
-                  hasMore: page.hasMore,
-                  count: page.data.length,
-                  data: page.data,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      });
+    'Search Jobs',
+    'List institution jobs (EEDM institution-jobs v12). Pass personId to list the jobs one person ' +
+      'holds. The person filter depends on the Banner Ethos API version; verify results.',
+    { personId: guid('Person GUID').optional() },
+    (a) => {
+      const criteria = personRefCriteria(a.personId);
+      return criteria
+        ? ethos().jobs.filter(criteria, a.offset, a.limit)
+        : ethos().jobs.getPage(a.offset, a.limit);
     },
   );
-
-  server.registerTool(
+  defineGetTool(
+    reg,
     'banner_jobs_get',
-    {
-      title: 'Get Job',
-      description: 'Get a single job by GUID from Banner via Ethos.',
-      inputSchema: {
-        id: z.string().describe('Job GUID'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const data = await getEthosClient().jobs.get(args.id);
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
-        };
-      });
-    },
+    'Get Job',
+    'Get an institution job by GUID.',
+    'Job GUID',
+    (id) => ethos().jobs.get(id),
   );
 }

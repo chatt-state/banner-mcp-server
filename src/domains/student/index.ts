@@ -1,15 +1,13 @@
 /**
  * Student domain module.
  *
- * Registers all student-related MCP tools with the server.
- * This module is lazy-loaded by the domain registry when
- * the "student" domain is requested.
+ * Registers person lookup, student context and student-record tools.
  */
 
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { ToolRegistrar } from '../../tools/define.js';
 import { registerStudentTools } from './tools.js';
 
-/** Registers student domain tools with the MCP server. */
-export function register(server: McpServer): void {
-  registerStudentTools(server);
+/** Registers student domain tools. */
+export function register(reg: ToolRegistrar): void {
+  registerStudentTools(reg);
 }

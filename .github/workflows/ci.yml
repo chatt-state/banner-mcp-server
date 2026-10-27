@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # package.json depends on "file:../ellucian-banner", so CI checks the SDK out
+  # side by side at this ref. Keep it in step with the canonical dependency
+  # (github:chatt-state/ellucian-banner#v0.2.0).
+  ELLUCIAN_BANNER_REF: v0.2.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # eslint 10 and vitest 4 require Node >= 20
+        node-version: [20.x, 22.x]
+
+    steps:
+      - name: Check out banner-mcp-server
+        uses: actions/checkout@v4
+        with:
+          path: banner-mcp-server
+
+      - name: Check out ellucian-banner (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: chatt-state/ellucian-banner
+          ref: ${{ env.ELLUCIAN_BANNER_REF }}
+          path: ellucian-banner
+          # If ellucian-banner is private/internal, add a read-only token secret
+          # (fine-grained PAT or GitHub App token with contents:read on that repo).
+          token: ${{ secrets.ELLUCIAN_BANNER_TOKEN || github.token }}
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: |
+            banner-mcp-server/package-lock.json
+            ellucian-banner/package-lock.json
+
+      - name: Build ellucian-banner
+        working-directory: ellucian-banner
+        run: npm ci --no-audit --no-fund # runs `prepare`, which builds dist/
+
+      - name: Install
+        working-directory: banner-mcp-server
+        run: npm ci --no-audit --no-fund
+      - name: Lint
+        working-directory: banner-mcp-server
+        run: npm run lint
+      - name: Typecheck
+        working-directory: banner-mcp-server
+        run: npm run typecheck
+      - name: Build
+        working-directory: banner-mcp-server
+        run: npm run build
+      - name: Test
+        working-directory: banner-mcp-server
+        run: npm test
+
+      - name: Smoke test (stdio + http config guard)
+        working-directory: banner-mcp-server
+        run: |
+          set -euo pipefail
+          # http mode must refuse to start without a token (exit 2)
+          set +e
+          ETHOS_API_KEY=dummy BANNER_MCP_TRANSPORT=http node dist/index.js
+          code=$?
+          set -e
+          test "$code" -eq 2
+          # stdio: initialize + tools/list with every domain loaded (no network needed)
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | ETHOS_API_KEY=dummy BANNER_PRELOAD_DOMAINS=all BANNER_AUDIT_LOG=false timeout 10 node dist/index.js \
+            | tee /tmp/out.jsonl
+          grep -q '"banner_person_lookup"' /tmp/out.jsonl
+          ! grep -q '"banner_ethos_delete"' /tmp/out.jsonl
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: banner-mcp-server
+      - uses: actions/checkout@v4
+        with:
+          repository: chatt-state/ellucian-banner
+          ref: ${{ env.ELLUCIAN_BANNER_REF }}
+          path: ellucian-banner
+          token: ${{ secrets.ELLUCIAN_BANNER_TOKEN || github.token }}
+      - name: Build image (context = parent of both repos)
+        run: docker build -f banner-mcp-server/Dockerfile -t banner-mcp-server:ci .
+      - name: Health check
+        run: |
+          set -euo pipefail
+          token="$(openssl rand -hex 24)"
+          docker run -d --name mcp -p 127.0.0.1:3001:3001 \
+            -e ETHOS_API_KEY=dummy -e BANNER_MCP_HTTP_TOKEN="$token" banner-mcp-server:ci
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:3001/healthz; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3001/healthz | grep -q '"ok"'
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:3001/mcp)" = 401
+          docker exec mcp id -u | grep -vq '^0$'
+          docker rm -f mcp

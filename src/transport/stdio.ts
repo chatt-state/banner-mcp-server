@@ -1,21 +1,23 @@
 /**
  * Stdio transport for MCP communication.
  *
- * Implements the standard input/output transport layer used
- * when the server is invoked as a subprocess by an MCP client.
+ * The server reads JSON-RPC messages from stdin and writes responses to
+ * stdout. Diagnostics and audit lines go to stderr.
  */
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { mcpServer } from '../server.js';
+import type { BannerMcpConfig } from '../config.js';
+import { log } from '../log.js';
+import { createBannerMcpServer, type BannerMcpServer } from '../server.js';
 
-/**
- * Starts the MCP server using stdio transport.
- *
- * The server reads JSON-RPC messages from stdin and writes
- * responses to stdout. Diagnostic output goes to stderr.
- */
-export async function startStdioTransport(): Promise<void> {
-  const transport = new StdioServerTransport();
-  await mcpServer.connect(transport);
-  console.error('Banner MCP Server running on stdio');
+/** Starts a single MCP server on stdio. */
+export async function startStdioTransport(config: BannerMcpConfig): Promise<BannerMcpServer> {
+  const mcp = createBannerMcpServer(config);
+  await mcp.server.connect(new StdioServerTransport());
+  const domains = mcp.registry.getLoadedDomains().join(', ') || 'none';
+  log(
+    'info',
+    `Banner MCP Server running on stdio (domains: ${domains}; writes ${config.allowWrites ? 'ENABLED' : 'disabled'})`,
+  );
+  return mcp;
 }
