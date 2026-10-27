@@ -78,22 +78,57 @@ function rpcError(res: ServerResponse, status: number, code: number, message: st
   sendJson(res, status, { jsonrpc: '2.0', error: { code, message }, id: null });
 }
 
-class BodyTooLarge extends Error {}
+/**
+ * An oversized body is read and discarded (not buffered) up to this many
+ * bytes so the client finishes sending and can read the 413; beyond it the
+ * connection is dropped.
+ */
+export const MAX_DRAIN_BYTES = 16 * MAX_BODY_BYTES;
 
+class BodyTooLarge extends Error {
+  constructor(readonly drained: boolean) {
+    super('Request body too large');
+  }
+}
+
+/**
+ * Reads the request body up to `limit` bytes. Over the limit it stops
+ * buffering and keeps draining (discarding) the rest, then rejects with
+ * BodyTooLarge once the request has ended, so the caller can still send a
+ * 413 the client will see. `drained` is false when the body was too large to
+ * drain, or Content-Length already announced that; the caller then answers
+ * and drops the connection.
+ */
 function readBody(req: IncomingMessage, limit: number): Promise<string> {
   return new Promise((resolve, reject) => {
+    const declared = Number(headerValue(req, 'content-length'));
+    if (Number.isFinite(declared) && declared > MAX_DRAIN_BYTES) {
+      req.pause();
+      reject(new BodyTooLarge(false));
+      return;
+    }
     const chunks: Buffer[] = [];
     let size = 0;
+    let tooLarge = Number.isFinite(declared) && declared > limit;
     req.on('data', (chunk: Buffer) => {
       size += chunk.length;
-      if (size > limit) {
-        reject(new BodyTooLarge());
-        req.destroy();
+      if (size > MAX_DRAIN_BYTES) {
+        req.removeAllListeners('data');
+        req.removeAllListeners('end');
+        req.pause();
+        reject(new BodyTooLarge(false));
         return;
       }
-      chunks.push(chunk);
+      if (size > limit) {
+        tooLarge = true;
+        chunks.length = 0;
+      }
+      if (!tooLarge) chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('end', () => {
+      if (tooLarge) reject(new BodyTooLarge(true));
+      else resolve(Buffer.concat(chunks).toString('utf8'));
+    });
     req.on('error', reject);
   });
 }
@@ -148,7 +183,20 @@ export function createHttpApp(
         body = JSON.parse(raw);
       } catch (err) {
         if (err instanceof BodyTooLarge) {
-          rpcError(res, 413, -32000, 'Request body too large');
+          if (!err.drained) {
+            // Unread data remains: close the connection once the 413 is flushed.
+            res.on('finish', () => req.socket.destroy());
+          }
+          sendJson(
+            res,
+            413,
+            {
+              jsonrpc: '2.0',
+              error: { code: -32000, message: `Request body exceeds ${MAX_BODY_BYTES} bytes` },
+              id: null,
+            },
+            { Connection: 'close' },
+          );
         } else {
           rpcError(res, 400, -32700, 'Parse error: invalid JSON');
         }

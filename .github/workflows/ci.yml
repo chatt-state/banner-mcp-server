@@ -18,6 +18,9 @@ env:
   # package.json depends on "file:../ellucian-banner", so CI checks the SDK out
   # side by side at this ref. Keep it in step with the canonical dependency
   # (github:chatt-state/ellucian-banner#v0.2.0).
+  # RELEASE ORDERING: the v0.2.0 tag must exist on the ellucian-banner commit
+  # that has filter/filterAll/namedQuery (its improve/production-ready changes)
+  # before this workflow is merged; main (0.1.0) lacks those APIs and will not build.
   ELLUCIAN_BANNER_REF: v0.2.0
 
 jobs:

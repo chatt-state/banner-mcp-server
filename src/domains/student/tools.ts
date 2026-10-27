@@ -18,7 +18,13 @@ import {
   buildSectionCriteria,
   personRefCriteria,
 } from './criteria.js';
-import { lookupPerson, resolveTermByCode, studentContext } from './handlers.js';
+import {
+  lookupPerson,
+  resolveTermByCode,
+  searchAcademicPeriods,
+  sectionsBySubject,
+  studentContext,
+} from './handlers.js';
 
 const CRITERIA_NOTE =
   ' Filters use Ethos criteria; support and matching rules depend on the Banner Ethos API ' +
@@ -202,9 +208,12 @@ export function registerStudentTools(reg: ToolRegistrar): void {
       title: 'Search Sections',
       description:
         'Search course sections (EEDM sections v16). Filter by term (academicPeriodCode such as ' +
-        '"202680", or academicPeriodId), section code, section number and/or courseId; or use ' +
-        'keyword for a keyword search (Ethos "keywordSearch" named query, cannot be combined with ' +
-        'other filters).' +
+        '"202680", or academicPeriodId), section code, section number and/or courseId. To list ' +
+        'the sections of a subject (e.g. "which BIOL sections run in 202680?") pass subject ' +
+        '(e.g. "BIOL", optionally with courseNumber such as "1110") with the term: the server ' +
+        'resolves the subject and its catalog courses and returns compact section summaries ' +
+        '(full records when "fields" is given). Or use keyword for a keyword search (Ethos ' +
+        '"keywordSearch" named query, cannot be combined with other filters).' +
         CRITERIA_NOTE,
       inputSchema: {
         academicPeriodCode: z.string().min(1).max(20).optional().describe('Banner term code'),
@@ -212,6 +221,16 @@ export function registerStudentTools(reg: ToolRegistrar): void {
         code: z.string().min(1).max(50).optional().describe('Section code'),
         number: z.string().min(1).max(20).optional().describe('Section number'),
         courseId: guid('Course GUID').optional(),
+        subject: z
+          .string()
+          .regex(/^[A-Za-z0-9]{1,10}$/, 'must be a subject abbreviation such as "BIOL"')
+          .optional()
+          .describe('Subject abbreviation, e.g. "BIOL"'),
+        courseNumber: z
+          .string()
+          .regex(/^[A-Za-z0-9]{1,10}$/, 'must be a course number such as "1110"')
+          .optional()
+          .describe('Catalog course number within subject, e.g. "1110" (needs subject)'),
         keyword: z.string().min(2).max(100).optional().describe('Keyword search text'),
         ...pagingShape,
         ...fieldsShape,
@@ -221,13 +240,35 @@ export function registerStudentTools(reg: ToolRegistrar): void {
       if (args.academicPeriodCode && args.academicPeriodId) {
         throw new ToolInputError('Give academicPeriodCode or academicPeriodId, not both.');
       }
+      if (args.courseNumber && !args.subject) {
+        throw new ToolInputError('courseNumber needs subject (e.g. subject "BIOL").');
+      }
+      if (args.subject && (args.courseId || args.keyword)) {
+        throw new ToolInputError('subject cannot be combined with courseId or keyword.');
+      }
       let academicPeriodId = args.academicPeriodId;
       if (args.academicPeriodCode) {
         academicPeriodId = (await resolveTermByCode(ethos(), args.academicPeriodCode)).id;
       }
+      if (args.subject) {
+        const payload = await sectionsBySubject(ethos(), {
+          subject: args.subject,
+          courseNumber: args.courseNumber,
+          academicPeriodId,
+          code: args.code,
+          number: args.number,
+          fields: args.fields,
+        });
+        return { payload, resultCount: payload.count };
+      }
       const criteria = buildSectionCriteria({ ...args, academicPeriodId });
       if (args.keyword) {
-        if (criteria) throw new ToolInputError('keyword cannot be combined with other filters.');
+        if (criteria) {
+          throw new ToolInputError(
+            'keyword cannot be combined with other filters. To list the sections of a subject ' +
+              'in a term, use subject (+ courseNumber) with academicPeriodCode.',
+          );
+        }
         const page = await ethos().sections.namedQuery(
           'keywordSearch',
           args.keyword,
@@ -299,20 +340,61 @@ export function registerStudentTools(reg: ToolRegistrar): void {
     reg,
     'banner_academic_periods_get',
     {
-      title: 'List Academic Periods',
+      title: 'Find Academic Periods',
       description:
-        'List academic periods (terms), or find one by Banner term code (code, e.g. "202680"). ' +
-        'Returns id, code, title ("Fall 2026"), start/end dates.',
+        'Find academic periods (terms) and their Banner term codes. Use title to turn a name ' +
+        'into a code (e.g. title "fall 2026"; every word must appear in the title, case-' +
+        'insensitive), currentAndUpcoming=true for terms that have not ended yet (soonest ' +
+        'first), or code for an exact Banner term code (e.g. "202680"). With none of these, ' +
+        'returns raw pages in API order. Returns id, code, title, start/end dates and category ' +
+        '(term/subterm/year). Do not guess term codes; look them up here.',
       inputSchema: {
-        code: z.string().min(1).max(20).optional().describe('Banner term code'),
+        code: z.string().min(1).max(20).optional().describe('Exact Banner term code'),
+        title: z
+          .string()
+          .min(2)
+          .max(100)
+          .optional()
+          .describe('Words that must appear in the term title, e.g. "fall 2026"'),
+        currentAndUpcoming: z
+          .boolean()
+          .optional()
+          .describe('Only terms that end today or later, soonest first'),
         ...pagingShape,
         ...fieldsShape,
       },
     },
     async (args) => {
-      const page = args.code
-        ? await ethos().academicPeriods.filter({ code: args.code }, args.offset, args.limit)
-        : await ethos().academicPeriods.getPage(args.offset, args.limit);
+      if (args.code && (args.title || args.currentAndUpcoming)) {
+        throw new ToolInputError('Give code, or title/currentAndUpcoming, not both.');
+      }
+      if (args.title || args.currentAndUpcoming) {
+        const payload = await searchAcademicPeriods(ethos(), {
+          title: args.title,
+          currentAndUpcoming: args.currentAndUpcoming,
+          limit: args.limit,
+        });
+        return { payload, resultCount: payload.count };
+      }
+      if (args.code) {
+        const code = args.code.trim();
+        const page = await ethos().academicPeriods.filter({ code }, args.offset, args.limit);
+        const exact = page.data.filter((p) => p.code === code);
+        if (exact.length === page.data.length) {
+          return { payload: pageEnvelope(page, args.fields), resultCount: page.data.length };
+        }
+        // The tenant ignored or loosened the code filter: return only the exact match.
+        return {
+          payload: {
+            ...pageEnvelope({ ...page, data: exact, hasMore: false }, args.fields),
+            totalCount: exact.length,
+            filterIgnored: true,
+            droppedRows: page.data.length - exact.length,
+          },
+          resultCount: exact.length,
+        };
+      }
+      const page = await ethos().academicPeriods.getPage(args.offset, args.limit);
       return { payload: pageEnvelope(page, args.fields), resultCount: page.data.length };
     },
   );

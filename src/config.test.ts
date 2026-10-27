@@ -50,6 +50,22 @@ describe('loadConfig', () => {
     expect(loadConfig({ ...base, BANNER_PRELOAD_DOMAINS: 'none' }).preloadDomains).toEqual([]);
   });
 
+  it('parses BANNER_API_PATH_PREFIXES with REST API defaults', () => {
+    expect(loadConfig(base).bannerApiPathPrefixes).toEqual([
+      '/StudentApi/api/',
+      '/BannerAdminBPAPI/api/',
+    ]);
+    expect(
+      loadConfig({ ...base, BANNER_API_PATH_PREFIXES: '/StudentApi/api, /Custom/v1/' })
+        .bannerApiPathPrefixes,
+    ).toEqual(['/StudentApi/api/', '/Custom/v1/']);
+    for (const bad of ['StudentApi/api', '/', '/a/../b/', 'https://x/api/', '/a b/']) {
+      expect(() => loadConfig({ ...base, BANNER_API_PATH_PREFIXES: bad })).toThrow(
+        'BANNER_API_PATH_PREFIXES',
+      );
+    }
+  });
+
   it('rejects unknown preload domains', () => {
     expect(() => loadConfig({ ...base, BANNER_PRELOAD_DOMAINS: 'student,bogus' })).toThrow(
       /unknown domain "bogus"/,

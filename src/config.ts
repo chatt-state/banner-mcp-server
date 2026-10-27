@@ -6,7 +6,7 @@
  * (never its value, since several variables hold secrets).
  */
 
-import { DOMAIN_NAMES, type DomainName } from './domains/names.js';
+import { DOMAIN_NAMES, isDomainName, type DomainName } from './domains/names.js';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -25,6 +25,8 @@ export interface BannerMcpConfig {
   bannerPassword?: string;
   /** True when base URL, username and password are all set. */
   bannerRestEnabled: boolean;
+  /** Path prefixes banner_api_get may read (each starts and ends with "/"). */
+  bannerApiPathPrefixes: string[];
   /** MCP transport: stdio or http. */
   transport: 'stdio' | 'http';
   /** HTTP transport port. */
@@ -117,19 +119,40 @@ function httpsUrl(env: Env, name: string, fallback?: string): string | undefined
   return raw.replace(/\/+$/, '');
 }
 
+/** Default banner_api_get path allow-list: the Banner REST API bases only. */
+export const DEFAULT_BANNER_API_PATH_PREFIXES = ['/StudentApi/api/', '/BannerAdminBPAPI/api/'];
+
+function parsePathPrefixes(env: Env): string[] {
+  const name = 'BANNER_API_PATH_PREFIXES';
+  const entries = list(env, name, DEFAULT_BANNER_API_PATH_PREFIXES.join(','));
+  if (entries.length === 0) throw new ConfigError(`${name} must list at least one path prefix`);
+  return entries.map((entry) => {
+    const prefix = entry.endsWith('/') ? entry : `${entry}/`;
+    if (
+      !/^\/[A-Za-z0-9\-._~]+(\/[A-Za-z0-9\-._~]+)*\/$/.test(prefix) ||
+      prefix.split('/').some((seg) => seg === '.' || seg === '..')
+    ) {
+      throw new ConfigError(
+        `${name} entries must be absolute paths such as /StudentApi/api/ (no dot segments)`,
+      );
+    }
+    return prefix;
+  });
+}
+
 function parsePreload(env: Env): DomainName[] {
   const entries = list(env, 'BANNER_PRELOAD_DOMAINS', 'student');
   if (entries.some((e) => e.toLowerCase() === 'all')) return [...DOMAIN_NAMES];
   if (entries.some((e) => e.toLowerCase() === 'none')) return [];
   const out: DomainName[] = [];
   for (const entry of entries) {
-    if (!(DOMAIN_NAMES as readonly string[]).includes(entry)) {
+    if (!isDomainName(entry)) {
       throw new ConfigError(
         `BANNER_PRELOAD_DOMAINS contains unknown domain "${entry}". ` +
           `Valid: ${DOMAIN_NAMES.join(', ')}, all, none`,
       );
     }
-    if (!out.includes(entry as DomainName)) out.push(entry as DomainName);
+    if (!out.includes(entry)) out.push(entry);
   }
   return out;
 }
@@ -183,6 +206,7 @@ export function loadConfig(env: Env = process.env): BannerMcpConfig {
     bannerUsername,
     bannerPassword,
     bannerRestEnabled: !!(bannerBaseUrl && bannerUsername && bannerPassword),
+    bannerApiPathPrefixes: parsePathPrefixes(env),
     transport,
     httpPort: int(env, 'BANNER_MCP_HTTP_PORT', 3001, 1, 65535),
     httpHost: str(env, 'BANNER_MCP_HTTP_HOST') ?? '127.0.0.1',

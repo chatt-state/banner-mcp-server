@@ -104,10 +104,19 @@ export interface TermSummary {
   title?: string;
   startOn?: string;
   endOn?: string;
+  /** "term", "subterm" or "year". */
+  category?: string;
 }
 
 export function summarizeTerm(t: AcademicPeriod): TermSummary {
-  return { id: t.id, code: t.code, title: t.title, startOn: t.startOn, endOn: t.endOn };
+  return {
+    id: t.id,
+    code: t.code,
+    title: t.title,
+    startOn: t.startOn,
+    endOn: t.endOn,
+    category: t.category?.type,
+  };
 }
 
 export function sectionTitle(s: Section): string | undefined {

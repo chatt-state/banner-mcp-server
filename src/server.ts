@@ -9,7 +9,8 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import type { BannerMcpConfig } from './config.js';
+import { readJson } from 'ellucian-banner';
+import { DEFAULT_BANNER_API_PATH_PREFIXES, type BannerMcpConfig } from './config.js';
 import { getBannerClient, getEthosClient } from './banner-client.js';
 import { DOMAIN_DESCRIPTIONS, DOMAIN_NAMES, DomainRegistry } from './domains/registry.js';
 import { ToolInputError } from './middleware/error-handler.js';
@@ -28,7 +29,10 @@ export interface BannerMcpServer {
  * on the configured host: no scheme/host, no dot segments, no encoded
  * separators, no query string (use the `query` argument).
  */
-export function validateBannerApiPath(path: string): string {
+export function validateBannerApiPath(
+  path: string,
+  allowedPrefixes: readonly string[] = DEFAULT_BANNER_API_PATH_PREFIXES,
+): string {
   if (!path.startsWith('/') || path.startsWith('//')) {
     throw new ToolInputError('path must start with a single "/" (e.g. "/StudentApi/api/terms")');
   }
@@ -45,7 +49,63 @@ export function validateBannerApiPath(path: string): string {
   if (!/^\/[A-Za-z0-9\-._~!$&'()*+,;=:@%/]*$/.test(path)) {
     throw new ToolInputError('path contains characters outside RFC 3986');
   }
+  // Only the Banner REST API bases: the service account's Basic credentials
+  // must not reach other web applications (admin consoles, UI pages) on the host.
+  if (!allowedPrefixes.some((prefix) => path.startsWith(prefix))) {
+    throw new ToolInputError(
+      `path must start with one of: ${allowedPrefixes.join(', ')} (BANNER_API_PATH_PREFIXES)`,
+    );
+  }
   return path;
+}
+
+/** Non-negative integer response header, or undefined. */
+function intHeader(headers: Headers, ...names: string[]): number | undefined {
+  for (const name of names) {
+    const raw = headers.get(name);
+    if (raw !== null && /^\s*\d+\s*$/.test(raw)) return Number(raw);
+  }
+  return undefined;
+}
+
+/**
+ * Page envelope for a Banner REST list response. Banner's restful-api plugin
+ * pages with `max`/`offset` request params and reports X-hedtech-totalCount,
+ * X-hedtech-pageOffset and X-hedtech-pageMaxSize response headers (some APIs
+ * send X-Total-Count instead). Without a total, `hasMore` is inferred from a
+ * full page, or reported as "unknown".
+ */
+export function bannerListEnvelope(
+  rows: unknown[],
+  headers: Headers,
+  query?: Record<string, string | number | boolean>,
+) {
+  const total = intHeader(headers, 'x-hedtech-totalcount', 'x-total-count');
+  const pageMax = intHeader(headers, 'x-hedtech-pagemaxsize');
+  const requestedOffset = Number(query?.['offset']);
+  const offset =
+    intHeader(headers, 'x-hedtech-pageoffset') ??
+    (Number.isSafeInteger(requestedOffset) && requestedOffset >= 0 ? requestedOffset : 0);
+  const count = rows.length;
+  let hasMore: boolean | 'unknown';
+  if (total !== undefined) hasMore = count > 0 && offset + count < total;
+  else if (pageMax !== undefined) hasMore = count > 0 && count >= pageMax;
+  else hasMore = 'unknown';
+  return {
+    ...(total !== undefined ? { totalCount: total } : {}),
+    offset,
+    count,
+    hasMore,
+    ...(hasMore === true ? { nextOffset: offset + count } : {}),
+    ...(hasMore === 'unknown'
+      ? {
+          pagingNote:
+            'Banner sent no paging headers; this may be a partial list. Pass query.max and ' +
+            'query.offset to page explicitly.',
+        }
+      : {}),
+    data: rows,
+  };
 }
 
 /** Default dependencies: the process-wide shared clients. */
@@ -145,9 +205,11 @@ export function createBannerMcpServer(
       {
         title: 'Banner REST GET',
         description:
-          'Read-only GET against a native Banner REST API on the configured BANNER_BASE_URL host ' +
-          '(e.g. "/StudentApi/api/terms", "/BannerAdminBPAPI/api/..."). The path must be absolute ' +
-          'on that host; put query parameters in "query". Only GET is supported.',
+          'Read-only GET against a native Banner REST API on the configured BANNER_BASE_URL host. ' +
+          `The path must start with one of: ${config.bannerApiPathPrefixes.join(', ')} ` +
+          '(e.g. "/StudentApi/api/terms"); put query parameters in "query". List results are ' +
+          'paged by Banner: pass query.max and query.offset, and check hasMore/totalCount ' +
+          '(hasMore "unknown" means Banner sent no paging headers). Only GET is supported.',
         inputSchema: {
           path: z.string().min(1).max(1000).describe('Absolute path on the Banner host'),
           query: z
@@ -160,18 +222,19 @@ export function createBannerMcpServer(
       async (args) => {
         const banner = deps.banner();
         if (!banner) throw new ToolInputError('Banner REST is not configured');
-        const path = validateBannerApiPath(args.path);
+        const path = validateBannerApiPath(args.path, config.bannerApiPathPrefixes);
         const qs = args.query
           ? new URLSearchParams(
               Object.entries(args.query).map(([k, v]) => [k, String(v)] as [string, string]),
             ).toString()
           : '';
-        const data = await banner.api('').get(qs ? `${path}?${qs}` : path);
+        const response = await banner.api('').getRaw(qs ? `${path}?${qs}` : path);
+        const data = await readJson<unknown>(response);
         if (Array.isArray(data)) {
           const rows = data.map((d) => projectFields(d, args.fields));
           // Envelope so an oversized list is trimmed to valid JSON, not cut mid-record.
           return {
-            payload: { offset: 0, count: rows.length, hasMore: false, data: rows },
+            payload: bannerListEnvelope(rows, response.headers, args.query),
             resultCount: rows.length,
           };
         }

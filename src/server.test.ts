@@ -1,8 +1,8 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { DOMAIN_NAMES } from './domains/names.js';
-import { ETHOS_WRITE_TOOLS } from './domains/ethos/tools.js';
+import { ETHOS_WRITE_TOOLS, isNonQueryGraphql } from './domains/ethos/tools.js';
 import { setAuditEnabled, setAuditSink } from './audit.js';
-import { validateBannerApiPath } from './server.js';
+import { bannerListEnvelope, validateBannerApiPath } from './server.js';
 import {
   callTool,
   connect,
@@ -95,8 +95,38 @@ describe('write gating', () => {
       query: 'mutation { deletePerson(id: "x") { id } }',
     });
     expect(res.isError).toBe(true);
-    expect(res.text).toContain('Only GraphQL queries');
+    expect(res.text).toContain('Only a valid GraphQL query');
     expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('does not let a quote inside a comment hide a mutation', async () => {
+    const hidden = '# "\nmutation { deletePerson(id: 1) { id } }\n# "';
+    expect(isNonQueryGraphql(hidden)).toBe(true);
+    const { fn } = mockFetch();
+    const { client } = await connect(makeConfig({ BANNER_PRELOAD_DOMAINS: 'ethos' }));
+    const res = await callTool(client, 'banner_ethos_graphql', { query: hidden });
+    expect(res.isError).toBe(true);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('classifies GraphQL documents by parsing them', () => {
+    // Allowed: queries (named, anonymous, shorthand) and fragments.
+    expect(isNonQueryGraphql('{ persons12 { edges { node { id } } } }')).toBe(false);
+    expect(
+      isNonQueryGraphql(
+        'query Q($id: ID) { persons12(filter: {id: {EQ: $id}}) { ...F } }\n' +
+          'fragment F on Persons12Connection { totalCount }',
+      ),
+    ).toBe(false);
+    // Keywords inside strings and comments are not operations.
+    expect(isNonQueryGraphql('# mutation\n{ a(s: "mutation { x }") }')).toBe(false);
+    expect(isNonQueryGraphql('{ a(s: """mutation { x }""") }')).toBe(false);
+    // Rejected: mutations, subscriptions, mixed documents, schema and parse errors.
+    expect(isNonQueryGraphql('mutation { x }')).toBe(true);
+    expect(isNonQueryGraphql('subscription { x }')).toBe(true);
+    expect(isNonQueryGraphql('query A { a } mutation B { b }')).toBe(true);
+    expect(isNonQueryGraphql('type Foo { a: Int }')).toBe(true);
+    expect(isNonQueryGraphql('{ unterminated')).toBe(true);
   });
 });
 
@@ -140,6 +170,7 @@ describe('audit logging through tools', () => {
                 {
                   id: '11111111-1111-1111-1111-111111111111',
                   names: [],
+                  credentials: [{ type: 'bannerId', value: 'A00777777' }],
                   dateOfBirth: '1999-09-09',
                 },
               ],
@@ -208,8 +239,82 @@ describe('banner_api_get', () => {
 
   it('validateBannerApiPath accepts normal paths', () => {
     expect(validateBannerApiPath('/StudentApi/api/terms')).toBe('/StudentApi/api/terms');
+    expect(validateBannerApiPath('/BannerAdminBPAPI/api/x')).toBe('/BannerAdminBPAPI/api/x');
     expect(() => validateBannerApiPath('relative')).toThrow();
     expect(() => validateBannerApiPath('/a\\b')).toThrow();
+  });
+
+  it('only allows the configured REST API prefixes', async () => {
+    for (const bad of [
+      '/BannerAdmin/',
+      '/applicationNavigator/seamless',
+      '/BannerExtensibility/internal/page',
+      '/StudentApi/apiX/terms',
+      '/studentapi/api/terms',
+      '/StudentApi/api',
+    ]) {
+      expect(() => validateBannerApiPath(bad)).toThrow(/BANNER_API_PATH_PREFIXES/);
+    }
+    expect(validateBannerApiPath('/Custom/api/x', ['/Custom/api/'])).toBe('/Custom/api/x');
+    expect(() => validateBannerApiPath('/StudentApi/api/terms', ['/Custom/api/'])).toThrow();
+
+    const { requests } = mockFetch(() => json([]));
+    const { client } = await connect(
+      makeConfig({ ...restEnv, BANNER_API_PATH_PREFIXES: '/StudentApi/api/' }),
+    );
+    const res = await callTool(client, 'banner_api_get', { path: '/BannerAdminBPAPI/api/x' });
+    expect(res.isError).toBe(true);
+    const res2 = await callTool(client, 'banner_api_get', { path: '/BannerAdmin/' });
+    expect(res2.isError).toBe(true);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('reports Banner REST paging headers instead of hasMore:false', async () => {
+    mockFetch((req) => {
+      if (req.url.origin !== TEST_BANNER) return undefined;
+      const rows = [{ code: 'a' }, { code: 'b' }];
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (req.url.pathname.endsWith('/hedtech')) {
+        headers['X-hedtech-totalCount'] = '7';
+        headers['X-hedtech-pageOffset'] = '2';
+        headers['X-hedtech-pageMaxSize'] = '2';
+      } else if (req.url.pathname.endsWith('/maxonly')) {
+        headers['X-hedtech-pageMaxSize'] = '2';
+      }
+      return new Response(JSON.stringify(rows), { status: 200, headers });
+    });
+    const { client } = await connect(makeConfig(restEnv));
+
+    const paged = await callTool(client, 'banner_api_get', {
+      path: '/StudentApi/api/hedtech',
+      query: { max: 2, offset: 2 },
+    });
+    expect(paged.data).toMatchObject({
+      totalCount: 7,
+      offset: 2,
+      count: 2,
+      hasMore: true,
+      nextOffset: 4,
+    });
+
+    const maxOnly = await callTool(client, 'banner_api_get', {
+      path: '/StudentApi/api/maxonly',
+      query: { offset: 4 },
+    });
+    expect(maxOnly.data).toMatchObject({ offset: 4, count: 2, hasMore: true, nextOffset: 6 });
+    expect(maxOnly.data['totalCount']).toBeUndefined();
+
+    const bare = await callTool(client, 'banner_api_get', { path: '/StudentApi/api/bare' });
+    expect(bare.data).toMatchObject({ offset: 0, count: 2, hasMore: 'unknown' });
+    expect(bare.data['pagingNote']).toMatch(/no paging headers/);
+  });
+
+  it('bannerListEnvelope computes the last page from X-Total-Count', () => {
+    const env = bannerListEnvelope([1, 2, 3], new Headers({ 'X-Total-Count': '5' }), {
+      offset: 2,
+    });
+    expect(env).toMatchObject({ totalCount: 5, offset: 2, count: 3, hasMore: false });
+    expect(env).not.toHaveProperty('nextOffset');
   });
 });
 

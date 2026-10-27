@@ -8,6 +8,7 @@
  */
 
 import { z } from 'zod';
+import { Kind, OperationTypeNode, parse } from 'graphql';
 import { defineTool, fieldsShape, pagingShape, type ToolRegistrar } from '../../tools/define.js';
 import { pageEnvelope, projectFields } from '../../output.js';
 import { ToolInputError } from '../../middleware/error-handler.js';
@@ -36,17 +37,25 @@ const versionSchema = z
 
 const criteriaSchema = z.record(z.string(), z.unknown());
 
-/** Removes string literals and comments so keyword checks see only GraphQL syntax. */
-function stripGraphqlLiterals(query: string): string {
-  return query
-    .replace(/"""[\s\S]*?"""/g, '""')
-    .replace(/"(?:\\.|[^"\\])*"/g, '""')
-    .replace(/#[^\n\r]*/g, '');
-}
-
-/** True when the GraphQL document declares a mutation or subscription operation. */
+/**
+ * True unless the document parses as GraphQL and every definition is a query
+ * operation or a fragment. Mutations, subscriptions, type-system definitions
+ * and unparseable documents all count as "not a query", so the read-only gate
+ * fails closed. Uses the reference GraphQL lexer/parser, so comments, strings
+ * and block strings are tokenized exactly as the server would see them.
+ */
 export function isNonQueryGraphql(query: string): boolean {
-  return /(^|[^A-Za-z0-9_])(mutation|subscription)\b/.test(stripGraphqlLiterals(query));
+  let doc;
+  try {
+    doc = parse(query, { noLocation: true });
+  } catch {
+    return true;
+  }
+  return !doc.definitions.every(
+    (d) =>
+      d.kind === Kind.FRAGMENT_DEFINITION ||
+      (d.kind === Kind.OPERATION_DEFINITION && d.operation === OperationTypeNode.QUERY),
+  );
 }
 
 /**
@@ -177,7 +186,9 @@ export function registerEthosTools(reg: ToolRegistrar): void {
     },
     async (args) => {
       if (isNonQueryGraphql(args.query)) {
-        throw new ToolInputError('Only GraphQL queries are allowed (no mutation/subscription).');
+        throw new ToolInputError(
+          'Only a valid GraphQL query document is allowed (no mutation/subscription, no syntax errors).',
+        );
       }
       const result = await ethos().graphql.query({ query: args.query, variables: args.variables });
       return { payload: result };

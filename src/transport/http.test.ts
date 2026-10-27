@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { AddressInfo } from 'node:net';
-import { checkBearer, createHttpApp, type HttpApp } from './http.js';
+import { checkBearer, createHttpApp, MAX_BODY_BYTES, type HttpApp } from './http.js';
 import { createBannerMcpServer } from '../server.js';
 import { makeConfig, testDeps, TEST_TOKEN } from '../testing/helpers.js';
 
@@ -209,5 +209,110 @@ describe('HTTP transport', () => {
     });
     expect(res.status).toBe(401);
     expect(app.sessions.has(sid)).toBe(true);
+  });
+});
+
+describe('HTTP limits', () => {
+  it('answers an oversized body with 413, not a connection reset', async () => {
+    const big = JSON.stringify({ ...initBody(1), pad: 'x'.repeat(MAX_BODY_BYTES + 1024) });
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: ACCEPT,
+        Authorization: `Bearer ${TEST_TOKEN}`,
+      },
+      body: big,
+    });
+    expect(res.status).toBe(413);
+    const body = (await res.json()) as { error: { message: string } };
+    expect(body.error.message).toMatch(/exceeds/);
+    // The server is still healthy afterwards.
+    expect((await fetch(`${base}/healthz`)).status).toBe(200);
+  });
+
+  it('answers 413 for a streamed body without Content-Length', async () => {
+    const chunk = new TextEncoder().encode('x'.repeat(64 * 1024));
+    let sent = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent > MAX_BODY_BYTES + chunk.length) {
+          controller.close();
+          return;
+        }
+        sent += chunk.length;
+        controller.enqueue(chunk);
+      },
+    });
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: ACCEPT,
+        Authorization: `Bearer ${TEST_TOKEN}`,
+      },
+      body: stream,
+      duplex: 'half',
+    } as RequestInit & { duplex: 'half' });
+    expect(res.status).toBe(413);
+    await res.text();
+  });
+
+  async function withApp(env: Record<string, string>, fn: (url: string) => Promise<void>) {
+    const cfg = makeConfig({
+      BANNER_MCP_TRANSPORT: 'http',
+      BANNER_MCP_HTTP_TOKEN: TEST_TOKEN,
+      BANNER_PRELOAD_DOMAINS: 'none',
+      ...env,
+    });
+    const other = createHttpApp(cfg, () => createBannerMcpServer(cfg, testDeps(cfg)));
+    await new Promise<void>((resolve) => other.httpServer.listen(0, '127.0.0.1', () => resolve()));
+    const port = (other.httpServer.address() as AddressInfo).port;
+    try {
+      await fn(`http://127.0.0.1:${port}`);
+    } finally {
+      await other.close();
+    }
+  }
+
+  it('refuses a new session past BANNER_MCP_MAX_SESSIONS with 503', async () => {
+    await withApp({ BANNER_MCP_MAX_SESSIONS: '1' }, async (url) => {
+      const init = (id: number) =>
+        fetch(`${url}/mcp`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: ACCEPT,
+            Authorization: `Bearer ${TEST_TOKEN}`,
+          },
+          body: JSON.stringify(initBody(id)),
+        });
+      const first = await init(1);
+      expect(first.status).toBe(200);
+      await first.text();
+      const second = await init(2);
+      expect(second.status).toBe(503);
+      expect(((await second.json()) as { error: { message: string } }).error.message).toMatch(
+        /Too many/,
+      );
+    });
+  });
+
+  it('rejects a Host header outside BANNER_MCP_ALLOWED_HOSTS with 403', async () => {
+    await withApp({ BANNER_MCP_ALLOWED_HOSTS: 'banner-mcp.example.edu' }, async (url) => {
+      // fetch sets Host to 127.0.0.1:<port>, which is not on the list.
+      const res = await fetch(`${url}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: ACCEPT,
+          Authorization: `Bearer ${TEST_TOKEN}`,
+        },
+        body: JSON.stringify(initBody(1)),
+      });
+      expect(res.status).toBe(403);
+      // /healthz is not subject to the Host check.
+      expect((await fetch(`${url}/healthz`)).status).toBe(200);
+    });
   });
 });
