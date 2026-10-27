@@ -25,9 +25,19 @@ export interface BannerMcpServer {
 }
 
 /**
- * Validates a Banner REST path for banner_api_get. Must be an absolute path
- * on the configured host: no scheme/host, no dot segments, no encoded
- * separators, no query string (use the `query` argument).
+ * Validates a Banner REST path for banner_api_get and returns the normalized
+ * path to fetch. Must be an absolute path on the configured host: no
+ * scheme/host, no dot segments, no encoded separators, no query string (use the
+ * `query` argument).
+ *
+ * The allowlist check runs on the *normalized* path, never the raw string. A
+ * raw-string prefix check is bypassable because a path a servlet container
+ * would collapse to a traversal — `..;/` (matrix/path parameters strip to
+ * `..`), `%2e%2e/` (percent-encoded dots), or a later `..` segment — can still
+ * start with an allowed prefix. So each segment has its `;`-parameters stripped
+ * and is percent-decoded before the dot-segment and separator checks, and the
+ * prefix match is done on the pathname `new URL` produces (which also resolves
+ * any residual dot segments) so what is checked is exactly what is fetched.
  */
 export function validateBannerApiPath(
   path: string,
@@ -43,20 +53,49 @@ export function validateBannerApiPath(
   if (/%(2e|2f|5c|00)/i.test(path)) {
     throw new ToolInputError('path must not contain encoded ".", "/", "\\" or NUL');
   }
-  if (path.split('/').some((seg) => seg === '.' || seg === '..')) {
-    throw new ToolInputError('path must not contain "." or ".." segments');
-  }
   if (!/^\/[A-Za-z0-9\-._~!$&'()*+,;=:@%/]*$/.test(path)) {
     throw new ToolInputError('path contains characters outside RFC 3986');
   }
+
+  // Normalize each segment: drop `;`-parameters and percent-decode, then reject
+  // anything that is or decodes to a traversal, a separator, or a control char.
+  const normalizedSegments = path.split('/').map((seg) => {
+    if (seg === '') return seg;
+    const bare = seg.split(';')[0] ?? '';
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(bare);
+    } catch {
+      throw new ToolInputError('path has invalid percent-encoding');
+    }
+    if (bare === '.' || bare === '..' || decoded === '.' || decoded === '..') {
+      throw new ToolInputError('path must not contain "." or ".." segments');
+    }
+    // eslint-disable-next-line no-control-regex -- rejecting control characters is the point
+    if (/[/\\\u0000-\u001f\u007f]/.test(decoded)) {
+      throw new ToolInputError('path segment must not contain separators or control characters');
+    }
+    return bare;
+  });
+
+  let normalized: string;
+  try {
+    normalized = new URL(`http://banner.invalid${normalizedSegments.join('/')}`).pathname;
+  } catch {
+    throw new ToolInputError('path is not a valid absolute path');
+  }
+  if (!normalized.startsWith('/') || normalized.startsWith('//')) {
+    throw new ToolInputError('path must resolve to a single absolute path');
+  }
+
   // Only the Banner REST API bases: the service account's Basic credentials
   // must not reach other web applications (admin consoles, UI pages) on the host.
-  if (!allowedPrefixes.some((prefix) => path.startsWith(prefix))) {
+  if (!allowedPrefixes.some((prefix) => normalized.startsWith(prefix))) {
     throw new ToolInputError(
       `path must start with one of: ${allowedPrefixes.join(', ')} (BANNER_API_PATH_PREFIXES)`,
     );
   }
-  return path;
+  return normalized;
 }
 
 /** Non-negative integer response header, or undefined. */

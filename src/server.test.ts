@@ -124,9 +124,43 @@ describe('write gating', () => {
     // Rejected: mutations, subscriptions, mixed documents, schema and parse errors.
     expect(isNonQueryGraphql('mutation { x }')).toBe(true);
     expect(isNonQueryGraphql('subscription { x }')).toBe(true);
+    // An aliased mutation field is still a mutation operation.
+    expect(isNonQueryGraphql('mutation { safeLooking: deletePerson(id: 1) { id } }')).toBe(true);
     expect(isNonQueryGraphql('query A { a } mutation B { b }')).toBe(true);
     expect(isNonQueryGraphql('type Foo { a: Int }')).toBe(true);
     expect(isNonQueryGraphql('{ unterminated')).toBe(true);
+  });
+
+  it('rejects an aliased mutation at the tool boundary', async () => {
+    const { fn } = mockFetch();
+    const { client } = await connect(makeConfig({ BANNER_PRELOAD_DOMAINS: 'ethos' }));
+    const res = await callTool(client, 'banner_ethos_graphql', {
+      query: 'mutation { ok: deletePerson(id: "x") { id } }',
+    });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain('Only a valid GraphQL query');
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('sends the re-printed query document, not the raw client string', async () => {
+    const { requests } = mockFetch((req) =>
+      req.url.pathname === '/graphql'
+        ? json({ data: { persons12: { totalCount: 0 } } })
+        : undefined,
+    );
+    const { client } = await connect(makeConfig({ BANNER_PRELOAD_DOMAINS: 'ethos' }));
+    // A valid query carrying a comment and irregular whitespace.
+    const raw = '# a comment\n{    persons12   {  totalCount   } }';
+    const res = await callTool(client, 'banner_ethos_graphql', { query: raw });
+    expect(res.isError).toBe(false);
+    const gql = requests.find((r) => r.url.pathname === '/graphql');
+    expect(gql).toBeDefined();
+    const sent = JSON.parse(gql!.body!) as { query: string };
+    // The bytes Ethos receives are the parser's canonical output, not the input:
+    // the comment is gone and the query was reformatted.
+    expect(sent.query).not.toBe(raw);
+    expect(sent.query).not.toContain('# a comment');
+    expect(sent.query).toContain('persons12');
   });
 });
 
@@ -242,6 +276,37 @@ describe('banner_api_get', () => {
     expect(validateBannerApiPath('/BannerAdminBPAPI/api/x')).toBe('/BannerAdminBPAPI/api/x');
     expect(() => validateBannerApiPath('relative')).toThrow();
     expect(() => validateBannerApiPath('/a\\b')).toThrow();
+  });
+
+  it('rejects traversal that only normalizes after parsing (parser differential)', () => {
+    // `;`-parameters strip to `..` in a servlet container; `%2e` decodes to `.`;
+    // a plain `..` segment escapes the base. None may pass the allowlist, even
+    // though the raw string still starts with an allowed prefix.
+    for (const bad of [
+      '/StudentApi/api/..;/secret',
+      '/StudentApi/api/..;/..;/BannerAdmin/console',
+      '/StudentApi/api/%2e%2e/secret',
+      '/StudentApi/api/foo/../../etc/passwd',
+      '/StudentApi/api/../../BannerAdmin/console',
+      '/StudentApi/api/x/%2e%2e;/y',
+    ]) {
+      expect(() => validateBannerApiPath(bad)).toThrow();
+    }
+    // A legitimate deep path is still allowed and returned normalized.
+    expect(validateBannerApiPath('/StudentApi/api/students/holds')).toBe(
+      '/StudentApi/api/students/holds',
+    );
+  });
+
+  it('matches the allowlist on the normalized path, not the raw string', async () => {
+    const { requests } = mockFetch(() => json([]));
+    const { client } = await connect(makeConfig(restEnv));
+    // `..;/` strips to `..` and escapes /StudentApi/api/ -> must never be fetched.
+    const res = await callTool(client, 'banner_api_get', {
+      path: '/StudentApi/api/..;/BannerAdmin/console',
+    });
+    expect(res.isError).toBe(true);
+    expect(requests).toHaveLength(0);
   });
 
   it('only allows the configured REST API prefixes', async () => {

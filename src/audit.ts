@@ -71,11 +71,15 @@ const SENSITIVE_KEYS = new Set(
 const PAYLOAD_KEYS = new Set(['data', 'query', 'variables', 'body'].map(normalizeKey));
 
 /**
- * Fields whose keys are chosen by the model (generic Ethos criteria for any
- * resource), so key-name redaction cannot be trusted: only the key structure
- * is logged and every leaf value except a GUID is replaced.
+ * Fields whose contents are free-form and model-chosen, so key-name redaction
+ * cannot be trusted: generic Ethos criteria (any resource's filter shape) and
+ * the `fields` projection list. These can carry names, emails, Banner IDs or
+ * identity-document numbers either as values or as the keys themselves, so we
+ * log only the key structure — every leaf value except a GUID, boolean or null
+ * is replaced. This is an allowlist at the leaf level (only non-identifying
+ * scalars survive), which a FERPA audit log needs for anything the model fills.
  */
-const STRUCTURE_ONLY_KEYS = new Set(['criteria'].map(normalizeKey));
+const STRUCTURE_ONLY_KEYS = new Set(['criteria', 'fields'].map(normalizeKey));
 
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Banner ID shape (one letter + 8 digits, e.g. A00123456). */

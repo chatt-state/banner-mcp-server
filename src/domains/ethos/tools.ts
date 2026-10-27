@@ -8,7 +8,7 @@
  */
 
 import { z } from 'zod';
-import { Kind, OperationTypeNode, parse } from 'graphql';
+import { Kind, OperationTypeNode, parse, print } from 'graphql';
 import { defineTool, fieldsShape, pagingShape, type ToolRegistrar } from '../../tools/define.js';
 import { pageEnvelope, projectFields } from '../../output.js';
 import { ToolInputError } from '../../middleware/error-handler.js';
@@ -51,6 +51,17 @@ export function isNonQueryGraphql(query: string): boolean {
   } catch {
     return true;
   }
+  return isNonQueryDocument(doc);
+}
+
+/**
+ * True unless every definition in an already-parsed document is a query
+ * operation or a fragment. Fragment definitions are allowed (a query may
+ * reference them); any mutation, subscription, aliased mutation, type-system
+ * definition, or a document that mixes a query with a non-query operation
+ * fails closed.
+ */
+function isNonQueryDocument(doc: ReturnType<typeof parse>): boolean {
   return !doc.definitions.every(
     (d) =>
       d.kind === Kind.FRAGMENT_DEFINITION ||
@@ -185,12 +196,25 @@ export function registerEthosTools(reg: ToolRegistrar): void {
       },
     },
     async (args) => {
-      if (isNonQueryGraphql(args.query)) {
+      let doc;
+      try {
+        doc = parse(args.query, { noLocation: true });
+      } catch {
         throw new ToolInputError(
           'Only a valid GraphQL query document is allowed (no mutation/subscription, no syntax errors).',
         );
       }
-      const result = await ethos().graphql.query({ query: args.query, variables: args.variables });
+      if (isNonQueryDocument(doc)) {
+        throw new ToolInputError(
+          'Only a valid GraphQL query document is allowed (no mutation/subscription, no syntax errors).',
+        );
+      }
+      // Send the parser's re-printed document, not the raw client string, so the
+      // bytes that reach Ethos are exactly what passed the read-only gate.
+      const result = await ethos().graphql.query({
+        query: print(doc),
+        variables: args.variables,
+      });
       return { payload: result };
     },
   );

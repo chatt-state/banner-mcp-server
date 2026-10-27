@@ -116,6 +116,59 @@ describe('sanitizeArgs', () => {
     });
   });
 
+  it('keeps criteria and fields to structure only, with no PII logged verbatim', () => {
+    const out = sanitizeArgs({
+      resource: 'persons',
+      // A QAPI/criteria body the model filled with person data.
+      criteria: {
+        names: [{ firstName: 'Ada', lastName: 'Lovelace' }],
+        emails: [{ address: 'ada@example.edu' }],
+        id: 'c2f2ba8a-0000-0000-0000-000000000001',
+      },
+      // The projection list can also name/carry identifying content.
+      fields: ['names.firstName', 'bsmith@example.edu'],
+    });
+    const text = JSON.stringify(out);
+    for (const secret of ['Ada', 'Lovelace', 'ada@example.edu', 'bsmith@example.edu']) {
+      expect(text).not.toContain(secret);
+    }
+    expect(out).toEqual({
+      resource: 'persons',
+      criteria: {
+        names: [{ firstName: '[redacted]', lastName: '[redacted]' }],
+        emails: [{ address: '[redacted]' }],
+        // A GUID record reference survives (needed to audit what was accessed).
+        id: 'c2f2ba8a-0000-0000-0000-000000000001',
+      },
+      fields: ['[redacted]', '[redacted]'],
+    });
+  });
+
+  it('writes no criteria/fields PII to the emitted audit line', () => {
+    const lines: string[] = [];
+    const prev = setAuditSink((l) => lines.push(l));
+    setAuditEnabled(true);
+    try {
+      audit({
+        tool: 'banner_ethos_qapi_search',
+        args: {
+          resource: 'persons',
+          criteria: { names: [{ lastName: 'Lovelace' }], emails: [{ address: 'ada@example.edu' }] },
+          fields: ['names', 'wjones@example.edu'],
+        },
+        durationMs: 3,
+        resultCount: 2,
+      });
+      expect(lines).toHaveLength(1);
+      for (const secret of ['Lovelace', 'ada@example.edu', 'wjones@example.edu']) {
+        expect(lines[0]).not.toContain(secret);
+      }
+    } finally {
+      setAuditSink(prev);
+      setAuditEnabled(true);
+    }
+  });
+
   it('fingerprints string payloads with a per-process key, not a bare SHA-256', () => {
     const variables = '{"id":"A00123456"}';
     const a = sanitizeArgs({ query: variables }) as Record<string, string>;
