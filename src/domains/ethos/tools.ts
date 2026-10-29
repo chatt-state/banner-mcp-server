@@ -1,334 +1,319 @@
 /**
- * MCP tool definitions for raw Ethos proxy operations.
+ * MCP tool definitions for generic Ethos access.
  *
- * These tools provide generic CRUD access to any EEDM resource
- * via the Ethos Integration proxy API, plus GraphQL, QAPI search,
- * criteria filter, and change notification consumption.
+ * Read tools are always registered when the domain loads. Tools that change
+ * data or queue state (create, update, delete, consume notifications) are
+ * registered only when BANNER_ALLOW_WRITES=true; otherwise they do not exist
+ * on the server at all.
  */
 
 import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { wrapToolHandler } from '../../middleware/error-handler.js';
-import { getEthosClient } from '../../banner-client.js';
+import { Kind, OperationTypeNode, parse, print } from 'graphql';
+import { defineTool, fieldsShape, pagingShape, type ToolRegistrar } from '../../tools/define.js';
+import { pageEnvelope, projectFields } from '../../output.js';
+import { ToolInputError } from '../../middleware/error-handler.js';
+
+/** Names of the write tools, for documentation and tests. */
+export const ETHOS_WRITE_TOOLS = [
+  'banner_ethos_create',
+  'banner_ethos_update',
+  'banner_ethos_delete',
+  'banner_ethos_consume_notifications',
+] as const;
+
+const resourceSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{1,100}$/, 'must be a plain EEDM resource name such as "persons"')
+  .describe('EEDM resource name (e.g. "persons", "sections", "academic-levels")');
+
+const idSchema = z.string().min(1).max(100).describe('Resource GUID');
+
+const versionSchema = z
+  .union([z.number().int().min(1).max(999), z.string().regex(/^\d+(\.\d+){0,2}$/)])
+  .optional()
+  .describe(
+    'EEDM version (e.g. 12 or "12.1.0"). Omit for the latest version, whose schema may change on upgrade.',
+  );
+
+const criteriaSchema = z.record(z.string(), z.unknown());
 
 /**
- * Registers all Ethos proxy tools with the MCP server.
+ * True unless the document parses as GraphQL and every definition is a query
+ * operation or a fragment. Mutations, subscriptions, type-system definitions
+ * and unparseable documents all count as "not a query", so the read-only gate
+ * fails closed. Uses the reference GraphQL lexer/parser, so comments, strings
+ * and block strings are tokenized exactly as the server would see them.
  */
-export function registerEthosTools(server: McpServer): void {
-  server.registerTool(
+export function isNonQueryGraphql(query: string): boolean {
+  let doc;
+  try {
+    doc = parse(query, { noLocation: true });
+  } catch {
+    return true;
+  }
+  return isNonQueryDocument(doc);
+}
+
+/**
+ * True unless every definition in an already-parsed document is a query
+ * operation or a fragment. Fragment definitions are allowed (a query may
+ * reference them); any mutation, subscription, aliased mutation, type-system
+ * definition, or a document that mixes a query with a non-query operation
+ * fails closed.
+ */
+function isNonQueryDocument(doc: ReturnType<typeof parse>): boolean {
+  return !doc.definitions.every(
+    (d) =>
+      d.kind === Kind.FRAGMENT_DEFINITION ||
+      (d.kind === Kind.OPERATION_DEFINITION && d.operation === OperationTypeNode.QUERY),
+  );
+}
+
+/**
+ * Registers Ethos tools.
+ */
+export function registerEthosTools(reg: ToolRegistrar): void {
+  const ethos = reg.deps.ethos;
+  const allowWrites = reg.config.allowWrites;
+
+  defineTool(
+    reg,
     'banner_ethos_get',
     {
       title: 'Ethos Get Resource',
       description:
-        'Get a single EEDM resource by name and GUID from Ethos. ' +
-        'Works with any resource (persons, students, courses, etc.).',
+        'Get one record of any EEDM resource by name and GUID, e.g. to resolve a GUID reference ' +
+        '("academic-levels", "student-types", "sites").',
       inputSchema: {
-        resource: z.string().describe('EEDM resource name (e.g., "persons", "students")'),
-        id: z.string().describe('Resource GUID'),
-        version: z.number().int().optional().describe('EEDM version number'),
+        resource: resourceSchema,
+        id: idSchema,
+        version: versionSchema,
+        ...fieldsShape,
       },
     },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const data = await getEthosClient().get(args.resource, args.id, args.version);
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
-        };
-      });
-    },
+    async (args) => ({
+      payload: projectFields(await ethos().get(args.resource, args.id, args.version), args.fields),
+      resultCount: 1,
+    }),
   );
 
-  server.registerTool(
+  defineTool(
+    reg,
     'banner_ethos_get_all',
     {
       title: 'Ethos List Resources',
-      description:
-        'Get a paginated list of any EEDM resource from Ethos. ' +
-        'Returns one page at a time with total count and pagination info.',
+      description: 'Get one page of any EEDM resource, unfiltered.',
       inputSchema: {
-        resource: z.string().describe('EEDM resource name (e.g., "persons", "sections")'),
-        offset: z.number().int().min(0).optional().describe('Pagination offset (default: 0)'),
-        limit: z.number().int().min(1).max(500).optional().describe('Page size (default: 25)'),
-        version: z.number().int().optional().describe('EEDM version number'),
+        resource: resourceSchema,
+        version: versionSchema,
+        ...pagingShape,
+        ...fieldsShape,
       },
     },
     async (args) => {
-      return wrapToolHandler(async () => {
-        const page = await getEthosClient().getPage(
-          args.resource,
-          args.offset,
-          args.limit,
-          args.version,
-        );
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  resource: args.resource,
-                  totalCount: page.totalCount,
-                  offset: page.offset,
-                  hasMore: page.hasMore,
-                  count: page.data.length,
-                  data: page.data,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      });
+      const page = await ethos().getPage(args.resource, args.offset, args.limit, args.version);
+      return {
+        payload: pageEnvelope(page, args.fields, { resource: args.resource }),
+        resultCount: page.data.length,
+      };
     },
   );
 
-  server.registerTool(
-    'banner_ethos_create',
-    {
-      title: 'Ethos Create Resource',
-      description: 'Create a new EEDM resource via the Ethos proxy.',
-      inputSchema: {
-        resource: z.string().describe('EEDM resource name'),
-        data: z.record(z.string(), z.unknown()).describe('Resource data to create'),
-        version: z.number().int().optional().describe('EEDM version number'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const result = await getEthosClient().create(args.resource, args.data, args.version);
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
-        };
-      });
-    },
-  );
-
-  server.registerTool(
-    'banner_ethos_update',
-    {
-      title: 'Ethos Update Resource',
-      description: 'Update an existing EEDM resource by GUID via the Ethos proxy.',
-      inputSchema: {
-        resource: z.string().describe('EEDM resource name'),
-        id: z.string().describe('Resource GUID'),
-        data: z.record(z.string(), z.unknown()).describe('Updated resource data'),
-        version: z.number().int().optional().describe('EEDM version number'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const result = await getEthosClient().update(
-          args.resource,
-          args.id,
-          args.data,
-          args.version,
-        );
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
-        };
-      });
-    },
-  );
-
-  server.registerTool(
-    'banner_ethos_delete',
-    {
-      title: 'Ethos Delete Resource',
-      description: 'Delete an EEDM resource by GUID via the Ethos proxy.',
-      inputSchema: {
-        resource: z.string().describe('EEDM resource name'),
-        id: z.string().describe('Resource GUID'),
-        version: z.number().int().optional().describe('EEDM version number'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        await getEthosClient().delete(args.resource, args.id, args.version);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `Resource ${args.resource}/${args.id} deleted successfully.`,
-            },
-          ],
-        };
-      });
-    },
-  );
-
-  server.registerTool(
-    'banner_ethos_graphql',
-    {
-      title: 'Ethos GraphQL Query',
-      description:
-        'Execute a GraphQL query against the Ethos Integration GraphQL endpoint. ' +
-        'Useful for complex queries that join multiple EEDM resources or need specific field selection.',
-      inputSchema: {
-        query: z.string().describe('GraphQL query string'),
-        variables: z
-          .record(z.string(), z.unknown())
-          .optional()
-          .describe('Optional GraphQL variables object'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const result = await getEthosClient().graphql.query({
-          query: args.query,
-          variables: args.variables,
-        });
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
-        };
-      });
-    },
-  );
-
-  server.registerTool(
-    'banner_ethos_qapi_search',
-    {
-      title: 'Ethos QAPI Search',
-      description:
-        'Search an EEDM resource using QAPI (POST-based criteria search). ' +
-        'Accepts a criteria object specific to the resource being searched. ' +
-        'Returns paginated results.',
-      inputSchema: {
-        resource: z.string().describe('EEDM resource name (e.g., "persons", "students")'),
-        criteria: z
-          .record(z.string(), z.unknown())
-          .describe('Search criteria object (resource-specific)'),
-        offset: z.number().int().min(0).optional().describe('Pagination offset (default: 0)'),
-        limit: z.number().int().min(1).max(500).optional().describe('Page size (default: 25)'),
-        version: z.number().int().optional().describe('EEDM version number'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const page = await getEthosClient().qapi.search(
-          args.resource,
-          args.criteria,
-          args.offset,
-          args.limit,
-          args.version,
-        );
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  resource: args.resource,
-                  totalCount: page.totalCount,
-                  offset: page.offset,
-                  hasMore: page.hasMore,
-                  count: page.data.length,
-                  data: page.data,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      });
-    },
-  );
-
-  server.registerTool(
+  defineTool(
+    reg,
     'banner_ethos_filter',
     {
       title: 'Ethos Criteria Filter',
       description:
-        'Filter an EEDM resource using GET-based criteria parameters. ' +
-        'Criteria are encoded as query parameters per the Ethos filter specification. ' +
-        'Returns paginated results.',
+        'Filter any EEDM resource with an Ethos criteria object (sent as ?criteria=<json>), e.g. ' +
+        '{"names":[{"lastName":"Smith"}]} for persons. Criteria shapes mirror the resource schema; ' +
+        'supported filters depend on the resource and the Banner Ethos API version.',
       inputSchema: {
-        resource: z.string().describe('EEDM resource name (e.g., "persons", "students")'),
-        criteria: z
-          .record(z.string(), z.unknown())
-          .describe('Filter criteria object (e.g., {"names.lastName": "Smith"})'),
-        offset: z.number().int().min(0).optional().describe('Pagination offset (default: 0)'),
-        limit: z.number().int().min(1).max(500).optional().describe('Page size (default: 25)'),
-        version: z.number().int().optional().describe('EEDM version number'),
+        resource: resourceSchema,
+        criteria: criteriaSchema.describe('Criteria object, e.g. {"code":"202680"}'),
+        version: versionSchema,
+        ...pagingShape,
+        ...fieldsShape,
       },
     },
     async (args) => {
-      return wrapToolHandler(async () => {
-        const page = await getEthosClient().filter(
-          args.resource,
-          args.criteria,
-          args.offset,
-          args.limit,
-          args.version,
-        );
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  resource: args.resource,
-                  totalCount: page.totalCount,
-                  offset: page.offset,
-                  hasMore: page.hasMore,
-                  count: page.data.length,
-                  data: page.data,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      });
+      const page = await ethos().filter(
+        args.resource,
+        args.criteria,
+        args.offset,
+        args.limit,
+        args.version,
+      );
+      return {
+        payload: pageEnvelope(page, args.fields, { resource: args.resource }),
+        resultCount: page.data.length,
+      };
     },
   );
 
-  server.registerTool(
+  defineTool(
+    reg,
+    'banner_ethos_qapi_search',
+    {
+      title: 'Ethos QAPI Search',
+      description:
+        'Search an EEDM resource with QAPI (POST /qapi/{resource}) using a partial resource as ' +
+        'criteria. Read-only, but only available for resources the tenant exposes via QAPI.',
+      inputSchema: {
+        resource: resourceSchema,
+        criteria: criteriaSchema.describe('Partial resource used as the search body'),
+        version: versionSchema,
+        ...pagingShape,
+        ...fieldsShape,
+      },
+    },
+    async (args) => {
+      const page = await ethos().qapi.search(
+        args.resource,
+        args.criteria,
+        args.offset,
+        args.limit,
+        args.version,
+      );
+      return {
+        payload: pageEnvelope(page, args.fields, { resource: args.resource }),
+        resultCount: page.data.length,
+      };
+    },
+  );
+
+  defineTool(
+    reg,
+    'banner_ethos_graphql',
+    {
+      title: 'Ethos GraphQL Query',
+      description:
+        'Run a read-only GraphQL query against Ethos (fields are version-suffixed, e.g. persons12, ' +
+        'sections16). Mutations and subscriptions are rejected.',
+      inputSchema: {
+        query: z.string().min(1).max(20_000).describe('GraphQL query document'),
+        variables: z.record(z.string(), z.unknown()).optional().describe('GraphQL variables'),
+      },
+    },
+    async (args) => {
+      let doc;
+      try {
+        doc = parse(args.query, { noLocation: true });
+      } catch {
+        throw new ToolInputError(
+          'Only a valid GraphQL query document is allowed (no mutation/subscription, no syntax errors).',
+        );
+      }
+      if (isNonQueryDocument(doc)) {
+        throw new ToolInputError(
+          'Only a valid GraphQL query document is allowed (no mutation/subscription, no syntax errors).',
+        );
+      }
+      // Send the parser's re-printed document, not the raw client string, so the
+      // bytes that reach Ethos are exactly what passed the read-only gate.
+      const result = await ethos().graphql.query({
+        query: print(doc),
+        variables: args.variables,
+      });
+      return { payload: result };
+    },
+  );
+
+  if (!allowWrites) return;
+
+  const writeAnnotations = {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: true,
+  };
+
+  defineTool(
+    reg,
+    'banner_ethos_create',
+    {
+      title: 'Ethos Create Resource',
+      description:
+        'WRITE: create a new EEDM record in Banner via Ethos. Confirm with the user before calling.',
+      inputSchema: {
+        resource: resourceSchema,
+        data: z.record(z.string(), z.unknown()).describe('Resource body'),
+        version: versionSchema,
+      },
+      annotations: writeAnnotations,
+    },
+    async (args) => ({
+      payload: await ethos().create(args.resource, args.data, args.version),
+      resultCount: 1,
+    }),
+  );
+
+  defineTool(
+    reg,
+    'banner_ethos_update',
+    {
+      title: 'Ethos Update Resource',
+      description:
+        'WRITE: replace an EEDM record (PUT) in Banner via Ethos. Confirm with the user before calling.',
+      inputSchema: {
+        resource: resourceSchema,
+        id: idSchema,
+        data: z.record(z.string(), z.unknown()).describe('Full updated resource body'),
+        version: versionSchema,
+      },
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async (args) => ({
+      payload: await ethos().update(args.resource, args.id, args.data, args.version),
+      resultCount: 1,
+    }),
+  );
+
+  defineTool(
+    reg,
+    'banner_ethos_delete',
+    {
+      title: 'Ethos Delete Resource',
+      description:
+        'WRITE: delete an EEDM record in Banner via Ethos. Irreversible; confirm with the user first.',
+      inputSchema: { resource: resourceSchema, id: idSchema, version: versionSchema },
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async (args) => {
+      await ethos().delete(args.resource, args.id, args.version);
+      return { payload: { deleted: true, resource: args.resource, id: args.id }, resultCount: 1 };
+    },
+  );
+
+  defineTool(
+    reg,
     'banner_ethos_consume_notifications',
     {
       title: 'Ethos Consume Change Notifications',
       description:
-        'Consume change notifications from the Ethos Integration message queue. ' +
-        'Returns a batch of notifications about created, updated, or deleted resources. ' +
-        'Use lastProcessedID to resume from a specific point.',
+        'QUEUE WRITE: consume a batch of change notifications for this Ethos application. ' +
+        'Requesting a batch acknowledges the previous one (Ethos deletes it from the queue), so ' +
+        'other integrations sharing this API key will not see those messages. Pass ' +
+        'lastProcessedID to acknowledge only up to that ID.',
       inputSchema: {
-        lastProcessedID: z
-          .number()
-          .int()
-          .optional()
-          .describe('Resume from this notification ID (exclusive)'),
-        limit: z
-          .number()
-          .int()
-          .min(1)
-          .optional()
-          .describe('Max notifications to return per poll'),
+        lastProcessedID: z.number().int().min(0).optional().describe('Acknowledge up to this ID'),
+        limit: z.number().int().min(1).max(1000).optional().describe('Max notifications (1-1000)'),
       },
+      annotations: writeAnnotations,
     },
     async (args) => {
-      return wrapToolHandler(async () => {
-        const notifications = await getEthosClient().notifications.consume({
-          lastProcessedID: args.lastProcessedID,
-          limit: args.limit,
-        });
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  count: notifications.length,
-                  notifications,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
+      const batch = await ethos().notifications.consumeBatch({
+        lastProcessedID: args.lastProcessedID,
+        limit: args.limit,
       });
+      return {
+        payload: {
+          count: batch.notifications.length,
+          remaining: batch.remaining,
+          notifications: batch.notifications,
+        },
+        resultCount: batch.notifications.length,
+      };
     },
   );
 }

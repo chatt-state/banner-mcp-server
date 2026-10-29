@@ -1,127 +1,45 @@
 /**
- * Financial Aid domain module.
- *
- * Provides tools for searching and retrieving financial aid
- * applications and awards via the Ethos typed resource accessors.
+ * Financial Aid domain module: applications and student awards.
  */
 
-import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { wrapToolHandler } from '../../middleware/error-handler.js';
-import { getEthosClient } from '../../banner-client.js';
+import { defineGetTool, defineSearchTool } from '../../tools/resource.js';
+import type { ToolRegistrar } from '../../tools/define.js';
 
-/** Registers financial aid domain tools with the MCP server. */
-export function register(server: McpServer): void {
-  server.registerTool(
+/** Registers financial aid domain tools. */
+export function register(reg: ToolRegistrar): void {
+  const ethos = reg.deps.ethos;
+
+  defineSearchTool(
+    reg,
     'banner_financial_aid_applications_search',
-    {
-      title: 'Search Financial Aid Applications',
-      description:
-        'Search for financial aid applications in Banner via Ethos. Returns paginated results.',
-      inputSchema: {
-        offset: z.number().int().min(0).optional().describe('Pagination offset (default: 0)'),
-        limit: z.number().int().min(1).max(500).optional().describe('Page size (default: 25)'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const page = await getEthosClient().financialAidApplications.getPage(
-          args.offset,
-          args.limit,
-        );
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  totalCount: page.totalCount,
-                  offset: page.offset,
-                  hasMore: page.hasMore,
-                  count: page.data.length,
-                  data: page.data,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      });
-    },
+    'Search Financial Aid Applications',
+    'List financial aid applications (EEDM financial-aid-applications v9).',
+    {},
+    (a) => ethos().financialAidApplications.getPage(a.offset, a.limit),
   );
-
-  server.registerTool(
+  defineGetTool(
+    reg,
     'banner_financial_aid_applications_get',
-    {
-      title: 'Get Financial Aid Application',
-      description: 'Get a single financial aid application by GUID from Banner via Ethos.',
-      inputSchema: {
-        id: z.string().describe('Financial aid application GUID'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const data = await getEthosClient().financialAidApplications.get(args.id);
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
-        };
-      });
-    },
+    'Get Financial Aid Application',
+    'Get a financial aid application by GUID.',
+    'Financial aid application GUID',
+    (id) => ethos().financialAidApplications.get(id),
   );
 
-  server.registerTool(
+  defineSearchTool(
+    reg,
     'banner_financial_aid_awards_search',
-    {
-      title: 'Search Financial Aid Awards',
-      description:
-        'Search for financial aid awards in Banner via Ethos. Returns paginated results.',
-      inputSchema: {
-        offset: z.number().int().min(0).optional().describe('Pagination offset (default: 0)'),
-        limit: z.number().int().min(1).max(500).optional().describe('Page size (default: 25)'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const page = await getEthosClient().financialAidAwards.getPage(args.offset, args.limit);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  totalCount: page.totalCount,
-                  offset: page.offset,
-                  hasMore: page.hasMore,
-                  count: page.data.length,
-                  data: page.data,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      });
-    },
+    'Search Financial Aid Awards',
+    'List student financial aid awards (EEDM student-financial-aid-awards v11).',
+    {},
+    (a) => ethos().studentFinancialAidAwards.getPage(a.offset, a.limit),
   );
-
-  server.registerTool(
+  defineGetTool(
+    reg,
     'banner_financial_aid_awards_get',
-    {
-      title: 'Get Financial Aid Award',
-      description: 'Get a single financial aid award by GUID from Banner via Ethos.',
-      inputSchema: {
-        id: z.string().describe('Financial aid award GUID'),
-      },
-    },
-    async (args) => {
-      return wrapToolHandler(async () => {
-        const data = await getEthosClient().financialAidAwards.get(args.id);
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
-        };
-      });
-    },
+    'Get Financial Aid Award',
+    'Get a student financial aid award by GUID.',
+    'Financial aid award GUID',
+    (id) => ethos().studentFinancialAidAwards.get(id),
   );
 }

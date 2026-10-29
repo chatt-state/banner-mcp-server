@@ -1,0 +1,9 @@
+# Used by BuildKit for Dockerfile (build context is the parent directory; see Dockerfile).
+**/node_modules
+**/dist
+**/coverage
+**/.git
+**/.env
+**/.env.*
+!**/.env.example
+**/*.log
